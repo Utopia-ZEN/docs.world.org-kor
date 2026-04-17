@@ -11,6 +11,7 @@
 - 번역 캐시(문장+모델 해시 키)로 중복 비용 절감
 - 내부 링크를 로컬 경로로 보정하여 미러 사이트에서 자연스럽게 이동
 - `output/` 정적 HTML + `summary.json` 생성
+- 사이트맵 기준 소스 fingerprint를 저장해 변경이 없으면 번역을 건너뜀(PASS)
 
 ## 로컬 실행
 
@@ -32,6 +33,8 @@ python scripts/translate_site.py \
 - `--openai-base-url` (기본: `https://api.openai.com/v1`)
 - `--openai-max-retries` (기본: `4`)
 - `--request-timeout` (기본: `30`)
+- `--state-path` (기본: `.state/source-fingerprint.json`)
+- `--translate-sleep` (기본: `0.03`, 과금/429 완화를 위해 증가 가능)
 
 출력:
 
@@ -39,6 +42,14 @@ python scripts/translate_site.py \
 - `output/**/index.html`
 - `output/summary.json`
 - `.translation-cache.json`
+
+`summary.json`에는 실행 진단용 메타데이터도 포함됩니다:
+- `summary_version`
+- `rate_limit_count`
+- `abort_reason`
+- `elapsed_seconds`
+- `cache_hit_ratio`
+- 구조화된 `errors` 항목(`url`, `error_type`, `status_code`, `message`)
 
 ## 자동 실행 (GitHub Actions)
 
@@ -57,3 +68,13 @@ python scripts/translate_site.py \
 python -m py_compile scripts/translate_site.py
 python -m unittest discover -s tests -p 'test_*.py'
 ```
+
+
+## 생성 결과가 안 보일 때 점검
+
+- `output/`은 실행 시점에 생성되는 산출물이며 `.gitignore`에 포함되어 Git에 커밋되지 않습니다.
+- 먼저 `OPENAI_API_KEY`가 설정되어 있는지 확인하세요.
+- 사이트맵 접근 실패 시에도 이제 `summary.json`에 `errors`가 기록되고, 최소한의 `output/index.html`과 `output/summary.json`이 생성됩니다.
+- GitHub Actions에서는 실행 로그와 아티팩트(`output`)를 Actions 탭에서 확인할 수 있습니다. 변경이 없으면 배포 단계는 PASS됩니다.
+- 429가 반복되면 런타임에서 자동으로 대기 시간을 늘리고, 연속 429가 임계치에 도달하면 해당 실행은 중단(ABORT)하여 빈번한 실패 로그 폭증을 방지합니다.
+- 429로 인해 실제 번역 성공(`urls_ok`)이 0건이면 `skip_reason=rate_limited`로 처리되어 배포를 건너뛰고 기존 Pages를 유지합니다.

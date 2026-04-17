@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Daily translator for docs.world.org -> Korean static mirror.
-
 Design goals
 - Translate human-readable documentation text into Korean.
 - Preserve code blocks, inline code identifiers, URLs, and command tokens.
 - Keep runs idempotent and cost-efficient through translation caching.
 """
-
 from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -17,19 +14,18 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, List, Set
 from urllib.parse import urlparse
-
 import requests
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
-
 DEFAULT_BASE_URL = "https://docs.world.org"
 DEFAULT_SITEMAP_URL = f"{DEFAULT_BASE_URL}/sitemap.xml"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_CACHE_PATH = ".translation-cache.json"
 DEFAULT_MODEL = "gpt-4.1-mini"
-
+DEFAULT_STATE_PATH = ".state/source-fingerprint.json"
+SUMMARY_VERSION = 1
 SKIP_TAGS = {"script", "style", "code", "pre", "kbd", "samp", "noscript"}
 SKIP_CONTAINERS = {
     "header",
@@ -43,8 +39,6 @@ KOREAN_RE = re.compile(r"[가-힣]")
 IDENTIFIER_ONLY_RE = re.compile(r"^[\w./:#\-]{2,}$")
 LEADING_WS_RE = re.compile(r"^\s*")
 TRAILING_WS_RE = re.compile(r"\s*$")
-
-
 @dataclass
 class Config:
     base_url: str
@@ -59,8 +53,7 @@ class Config:
     per_page_sleep: float
     translate_sleep: float
     openai_max_retries: int
-
-
+    state_path: Path
 @dataclass
 class TranslationStats:
     urls_total: int = 0
@@ -71,6 +64,47 @@ class TranslationStats:
     segments_translated: int = 0
 
 
+class RateLimitError(Exception):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def build_summary(
+    *,
+    cfg: Config,
+    stats: TranslationStats,
+    processed: List[str],
+    errors: List[Dict[str, object]],
+    skipped: bool,
+    started: float,
+    rate_limit_count: int,
+    abort_reason: str,
+    skip_reason: str = "",
+) -> Dict[str, object]:
+    return {
+        "summary_version": SUMMARY_VERSION,
+        "base_url": cfg.base_url,
+        "sitemap_url": cfg.sitemap_url,
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "stats": stats.__dict__,
+        "processed_urls": processed,
+        "errors": errors,
+        "skipped": skipped,
+        "skip_reason": skip_reason if skipped else "",
+        "rate_limit_count": rate_limit_count,
+        "abort_reason": abort_reason,
+        "elapsed_seconds": round(time.time() - started, 2),
+        "cache_hit_ratio": (
+            round(stats.segments_cached / stats.segments_total, 4)
+            if stats.segments_total
+            else 0.0
+        ),
+    }
+@dataclass
+class SitemapEntry:
+    url: str
+    lastmod: str = ""
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate docs.world.org pages into Korean")
     parser.add_argument("--base-url", default=os.getenv("SOURCE_BASE_URL", DEFAULT_BASE_URL))
@@ -106,9 +140,11 @@ def parse_args() -> argparse.Namespace:
         "--openai-base-url",
         default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
     )
+    parser.add_argument(
+        "--state-path",
+        default=os.getenv("STATE_PATH", DEFAULT_STATE_PATH),
+    )
     return parser.parse_args()
-
-
 def build_config(args: argparse.Namespace) -> Config:
     return Config(
         base_url=args.base_url.rstrip("/"),
@@ -123,9 +159,8 @@ def build_config(args: argparse.Namespace) -> Config:
         per_page_sleep=args.per_page_sleep,
         translate_sleep=args.translate_sleep,
         openai_max_retries=args.openai_max_retries,
+        state_path=Path(args.state_path),
     )
-
-
 def load_cache(path: Path) -> Dict[str, str]:
     if not path.exists():
         return {}
@@ -136,20 +171,13 @@ def load_cache(path: Path) -> Dict[str, str]:
     except json.JSONDecodeError:
         pass
     return {}
-
-
 def save_cache(path: Path, cache: Dict[str, str]) -> None:
     path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def normalize_text(text: str) -> str:
     return WHITESPACE_RE.sub(" ", text).strip()
-
-
 def should_translate_text(text: str) -> bool:
     if not text or text.isspace():
         return False
-
     stripped = normalize_text(text)
     if len(stripped) < 2:
         return False
@@ -158,8 +186,6 @@ def should_translate_text(text: str) -> bool:
     if IDENTIFIER_ONLY_RE.fullmatch(stripped):
         return False
     return True
-
-
 def preserve_surrounding_whitespace(original: str, translated: str) -> str:
     leading = LEADING_WS_RE.search(original)
     trailing = TRAILING_WS_RE.search(original)
@@ -167,13 +193,9 @@ def preserve_surrounding_whitespace(original: str, translated: str) -> str:
     trailing_ws = trailing.group(0) if trailing else ""
     core = translated.strip()
     return f"{leading_ws}{core}{trailing_ws}"
-
-
 def digest(model: str, text: str) -> str:
     payload = f"{model}\n{text}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
-
-
 def request_with_retry(
     session: requests.Session,
     method: str,
@@ -188,33 +210,48 @@ def request_with_retry(
         try:
             res = session.request(method, url, timeout=timeout, **kwargs)
             if res.status_code in {429, 500, 502, 503, 504}:
+                retry_after = res.headers.get("Retry-After")
                 if attempt == max_retries:
+                    if res.status_code == 429:
+                        parsed_retry_after = None
+                        if retry_after:
+                            try:
+                                parsed_retry_after = float(retry_after)
+                            except ValueError:
+                                parsed_retry_after = None
+                        raise RateLimitError(
+                            f"429 Too Many Requests for {url}",
+                            retry_after=parsed_retry_after,
+                        )
                     res.raise_for_status()
-                time.sleep(backoff)
+                if retry_after:
+                    try:
+                        time.sleep(max(float(retry_after), backoff))
+                    except ValueError:
+                        time.sleep(backoff)
+                else:
+                    time.sleep(backoff)
                 backoff *= 2
                 continue
             res.raise_for_status()
             return res
+        except RateLimitError:
+            raise
         except requests.RequestException:
             if attempt == max_retries:
                 raise
             time.sleep(backoff)
             backoff *= 2
-
     raise RuntimeError("unreachable retry state")
-
-
 def translate_segment(session: requests.Session, cfg: Config, text: str) -> str:
     if not cfg.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is required for translation")
-
     system_prompt = (
         "Translate input into natural Korean for technical docs. "
         "IMPORTANT: preserve code blocks, inline backticks, identifiers, URLs, "
         "file paths, shell commands, and version strings exactly. "
         "Do not add explanation. Return only translated text."
     )
-
     res = request_with_retry(
         session,
         "POST",
@@ -234,47 +271,45 @@ def translate_segment(session: requests.Session, cfg: Config, text: str) -> str:
             ],
         },
     )
-
     content = res.json()["choices"][0]["message"]["content"]
     return str(content).strip()
-
-
 def fetch_text(session: requests.Session, url: str, timeout: int) -> str:
     res = request_with_retry(session, "GET", url, timeout=timeout, max_retries=3)
     return res.text
-
-
-def parse_sitemap(session: requests.Session, sitemap_url: str, timeout: int) -> List[str]:
+def parse_sitemap(session: requests.Session, sitemap_url: str, timeout: int) -> List[SitemapEntry]:
     seen: Set[str] = set()
-
-    def _parse(url: str) -> List[str]:
+    def _parse(url: str) -> List[SitemapEntry]:
         if url in seen:
             return []
         seen.add(url)
-
         xml = fetch_text(session, url, timeout=timeout)
         soup = BeautifulSoup(xml, "xml")
-
         nested = [loc.text.strip() for loc in soup.select("sitemap > loc") if loc.text]
         if nested:
-            urls: List[str] = []
+            entries: List[SitemapEntry] = []
             for nested_url in nested:
-                urls.extend(_parse(nested_url))
-            return urls
-
-        return [loc.text.strip() for loc in soup.select("url > loc") if loc.text]
-
+                entries.extend(_parse(nested_url))
+            return entries
+        entries: List[SitemapEntry] = []
+        for url_node in soup.select("url"):
+            loc_node = url_node.select_one("loc")
+            if not loc_node or not loc_node.text:
+                continue
+            lastmod_node = url_node.select_one("lastmod")
+            entries.append(
+                SitemapEntry(
+                    url=loc_node.text.strip(),
+                    lastmod=lastmod_node.text.strip() if lastmod_node and lastmod_node.text else "",
+                )
+            )
+        return entries
     return _parse(sitemap_url)
-
-
 def pick_main_content(soup: BeautifulSoup) -> Tag:
     for selector in ["main", "article", "div.theme-doc-markdown", "body"]:
         node = soup.select_one(selector)
         if isinstance(node, Tag):
             return node
     return soup
-
-
 def should_skip_node(parent: Tag) -> bool:
     if parent.name in SKIP_TAGS:
         return True
@@ -282,8 +317,6 @@ def should_skip_node(parent: Tag) -> bool:
         if isinstance(anc, Tag) and anc.name in SKIP_CONTAINERS:
             return True
     return False
-
-
 def rewrite_internal_links_to_relative(soup: BeautifulSoup, base_url: str) -> None:
     base_host = urlparse(base_url).netloc
     for anchor in soup.select("a[href]"):
@@ -297,8 +330,6 @@ def rewrite_internal_links_to_relative(soup: BeautifulSoup, base_url: str) -> No
             if parsed.fragment:
                 local += f"#{parsed.fragment}"
             anchor["href"] = local
-
-
 def translate_html(
     html: str,
     *,
@@ -309,7 +340,6 @@ def translate_html(
 ) -> str:
     soup = BeautifulSoup(html, "lxml")
     main = pick_main_content(soup)
-
     def translate_value(original: str) -> str:
         normalized = normalize_text(original)
         stats.segments_total += 1
@@ -317,23 +347,19 @@ def translate_html(
         if key in cache:
             stats.segments_cached += 1
             return preserve_surrounding_whitespace(original, cache[key])
-
         translated = translate_segment(session, cfg, normalized)
         cache[key] = translated
         stats.segments_translated += 1
         time.sleep(cfg.translate_sleep)
         return preserve_surrounding_whitespace(original, translated)
-
     for text_node in list(main.find_all(string=True)):
         parent = text_node.parent
         if not isinstance(parent, Tag) or should_skip_node(parent):
             continue
-
         original = str(text_node)
         if not should_translate_text(original):
             continue
         text_node.replace_with(NavigableString(translate_value(original)))
-
     for el in main.find_all(True):
         if should_skip_node(el):
             continue
@@ -342,34 +368,40 @@ def translate_html(
                 raw_value = str(el.attrs[attr])
                 if should_translate_text(raw_value):
                     el.attrs[attr] = translate_value(raw_value)
-
     if isinstance(soup.html, Tag):
         soup.html.attrs["lang"] = "ko"
-
     rewrite_internal_links_to_relative(soup, cfg.base_url)
     return str(soup)
-
-
 def output_path_for_url(url: str, output_dir: Path) -> Path:
     parsed = urlparse(url)
     path = parsed.path.strip("/")
-
     if not path:
         path = "index"
-
     if path.endswith(".html"):
         rel = Path(path)
     else:
         rel = Path(path) / "index.html"
-
     return output_dir / rel
-
-
-def keep_same_domain(urls: Iterable[str], base_url: str) -> List[str]:
-    base_host = urlparse(base_url).netloc
-    return [url for url in urls if urlparse(url).netloc == base_host]
-
-
+def compute_source_fingerprint(entries: List[SitemapEntry]) -> str:
+    payload = "\n".join(sorted(f"{e.url}|{e.lastmod}" for e in entries))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def has_source_changed(entries: List[SitemapEntry], state_path: Path) -> bool:
+    current = compute_source_fingerprint(entries)
+    if not state_path.exists():
+        return True
+    try:
+        previous = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return True
+    return previous.get("fingerprint") != current
+def save_source_fingerprint(entries: List[SitemapEntry], state_path: Path) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fingerprint": compute_source_fingerprint(entries),
+        "saved_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "entry_count": len(entries),
+    }
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 def build_index(output_dir: Path, processed_urls: List[str]) -> None:
     links = "\n".join(
         f"<li><a href='{urlparse(url).path or '/'}'>{url}</a></li>" for url in processed_urls
@@ -388,21 +420,53 @@ def build_index(output_dir: Path, processed_urls: List[str]) -> None:
 </html>
 """
     (output_dir / "index.html").write_text(html, encoding="utf-8")
-
-
 def run(cfg: Config) -> Dict[str, object]:
+    started = time.time()
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     cache = load_cache(cfg.cache_path)
     stats = TranslationStats()
     session = requests.Session()
-
-    urls = parse_sitemap(session, cfg.sitemap_url, timeout=cfg.request_timeout)
-    urls = keep_same_domain(urls, cfg.base_url)
-    urls = urls[: cfg.max_urls]
-    stats.urls_total = len(urls)
-
     processed: List[str] = []
-
+    errors: List[Dict[str, object]] = []
+    rate_limit_errors = 0
+    abort_reason = ""
+    try:
+        entries = parse_sitemap(session, cfg.sitemap_url, timeout=cfg.request_timeout)
+        entries = [e for e in entries if urlparse(e.url).netloc == urlparse(cfg.base_url).netloc]
+    except Exception as exc:  # noqa: BLE001
+        # If sitemap lookup fails, still generate a minimal output by trying base URL.
+        err = {
+            "url": cfg.sitemap_url,
+            "error_type": type(exc).__name__,
+            "status_code": None,
+            "message": str(exc),
+        }
+        errors.append(err)
+        print(f"[SITEMAP_ERR] {cfg.sitemap_url}: {exc}")
+        entries = [SitemapEntry(url=cfg.base_url, lastmod="")]
+    entries = entries[: cfg.max_urls]
+    urls = [e.url for e in entries]
+    stats.urls_total = len(urls)
+    if not has_source_changed(entries, cfg.state_path):
+        summary = build_summary(
+            cfg=cfg,
+            stats=stats,
+            processed=processed,
+            errors=errors,
+            skipped=True,
+            skip_reason="no_source_changes",
+            started=started,
+            rate_limit_count=rate_limit_errors,
+            abort_reason=abort_reason,
+        )
+        (cfg.output_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        build_index(cfg.output_dir, processed)
+        print("[PASS] No source changes detected. Skipping translation.")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return summary
     for url in urls:
         try:
             page = fetch_text(session, url, timeout=cfg.request_timeout)
@@ -416,39 +480,92 @@ def run(cfg: Config) -> Dict[str, object]:
             out = output_path_for_url(url, cfg.output_dir)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(translated_html, encoding="utf-8")
-
             processed.append(url)
             stats.urls_ok += 1
             print(f"[OK] {url} -> {out}")
             time.sleep(cfg.per_page_sleep)
+        except RateLimitError as exc:
+            stats.urls_failed += 1
+            rate_limit_errors += 1
+            errors.append(
+                {
+                    "url": url,
+                    "error_type": "RateLimitError",
+                    "status_code": 429,
+                    "message": str(exc),
+                    "retry_after": exc.retry_after,
+                }
+            )
+            print(f"[ERR] {url}: {exc}")
+            sleep_seconds = exc.retry_after if exc.retry_after is not None else min(60, 10 * rate_limit_errors)
+            time.sleep(sleep_seconds)
+            if rate_limit_errors >= 3:
+                abort_reason = "too_many_rate_limits"
+                errors.append(
+                    {
+                        "url": url,
+                        "error_type": "Abort",
+                        "status_code": None,
+                        "message": "Too many consecutive 429 errors. Stopping this run.",
+                    }
+                )
+                print("[ABORT] Too many consecutive 429 errors. Stopping this run.")
+                break
         except Exception as exc:  # noqa: BLE001
             stats.urls_failed += 1
+            errors.append(
+                {
+                    "url": url,
+                    "error_type": type(exc).__name__,
+                    "status_code": None,
+                    "message": str(exc),
+                }
+            )
             print(f"[ERR] {url}: {exc}")
-
     build_index(cfg.output_dir, processed)
     save_cache(cfg.cache_path, cache)
+    # If the run effectively failed due to rate limiting, mark as skipped so
+    # workflow deploy is skipped and previous published site remains intact.
+    if rate_limit_errors > 0 and stats.urls_ok == 0:
+        summary = build_summary(
+            cfg=cfg,
+            stats=stats,
+            processed=processed,
+            errors=errors,
+            skipped=True,
+            skip_reason="rate_limited",
+            started=started,
+            rate_limit_count=rate_limit_errors,
+            abort_reason=abort_reason or "rate_limited_zero_success",
+        )
+        (cfg.output_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print("[PASS] Skipping deploy because translation run was rate-limited.")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return summary
 
-    summary = {
-        "base_url": cfg.base_url,
-        "sitemap_url": cfg.sitemap_url,
-        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "stats": stats.__dict__,
-        "processed_urls": processed,
-    }
-
+    save_source_fingerprint(entries, cfg.state_path)
+    summary = build_summary(
+        cfg=cfg,
+        stats=stats,
+        processed=processed,
+        errors=errors,
+        skipped=False,
+        started=started,
+        rate_limit_count=rate_limit_errors,
+        abort_reason=abort_reason,
+    )
     (cfg.output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
-
-
 def main() -> None:
     args = parse_args()
     cfg = build_config(args)
     run(cfg)
-
-
 if __name__ == "__main__":
     main()

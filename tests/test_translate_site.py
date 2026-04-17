@@ -1,13 +1,17 @@
 import unittest
+from unittest.mock import patch
 from pathlib import Path
+import tempfile
 
 from bs4 import BeautifulSoup
 
 from scripts.translate_site import (
     Config,
+    RateLimitError,
     TranslationStats,
     output_path_for_url,
     preserve_surrounding_whitespace,
+    run,
     should_translate_text,
     translate_html,
 )
@@ -57,6 +61,7 @@ class TranslateSiteTests(unittest.TestCase):
             per_page_sleep=0,
             translate_sleep=0,
             openai_max_retries=1,
+            state_path=Path(".state/source-fingerprint.json"),
         )
 
         cache = {}
@@ -81,6 +86,110 @@ class TranslateSiteTests(unittest.TestCase):
         soup = BeautifulSoup(out, "lxml")
         self.assertIn("KO(Hello docs)", soup.get_text())
         self.assertIn("npm install world-id", soup.get_text())
+
+    def test_run_writes_summary_when_sitemap_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = Config(
+                base_url="https://docs.world.org",
+                sitemap_url="https://docs.world.org/sitemap.xml",
+                output_dir=tmp,
+                cache_path=tmp / ".translation-cache.json",
+                openai_api_key="dummy",
+                openai_base_url="https://api.openai.com/v1",
+                openai_model="gpt-4.1-mini",
+                max_urls=1,
+                request_timeout=1,
+                per_page_sleep=0,
+                translate_sleep=0,
+                openai_max_retries=0,
+                state_path=tmp / ".state/source-fingerprint.json",
+            )
+
+            with patch("scripts.translate_site.parse_sitemap", side_effect=RuntimeError("boom")):
+                with patch("scripts.translate_site.fetch_text", side_effect=RuntimeError("fetch fail")):
+                    summary = run(cfg)
+
+            self.assertTrue((tmp / "index.html").exists())
+            self.assertTrue((tmp / "summary.json").exists())
+            self.assertIn("errors", summary)
+            self.assertGreaterEqual(len(summary["errors"]), 1)
+            self.assertIsInstance(summary["errors"][0], dict)
+            self.assertEqual(summary.get("summary_version"), 1)
+            self.assertIn("elapsed_seconds", summary)
+            self.assertIn("cache_hit_ratio", summary)
+
+    def test_run_skips_when_no_source_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state = tmp / ".state/source-fingerprint.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text('{"fingerprint":"dummy"}', encoding="utf-8")
+
+            cfg = Config(
+                base_url="https://docs.world.org",
+                sitemap_url="https://docs.world.org/sitemap.xml",
+                output_dir=tmp,
+                cache_path=tmp / ".translation-cache.json",
+                openai_api_key="dummy",
+                openai_base_url="https://api.openai.com/v1",
+                openai_model="gpt-4.1-mini",
+                max_urls=1,
+                request_timeout=1,
+                per_page_sleep=0,
+                translate_sleep=0,
+                openai_max_retries=0,
+                state_path=state,
+            )
+
+            import scripts.translate_site as mod
+            entry = mod.SitemapEntry(url="https://docs.world.org/page", lastmod="2026-01-01")
+
+            with patch("scripts.translate_site.parse_sitemap", return_value=[entry]):
+                with patch("scripts.translate_site.has_source_changed", return_value=False):
+                    summary = run(cfg)
+
+            self.assertTrue(summary.get("skipped"))
+            self.assertEqual(summary.get("skip_reason"), "no_source_changes")
+            self.assertEqual(summary.get("summary_version"), 1)
+
+    def test_run_marks_rate_limited_when_all_pages_fail_with_429(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state = tmp / ".state/source-fingerprint.json"
+            cfg = Config(
+                base_url="https://docs.world.org",
+                sitemap_url="https://docs.world.org/sitemap.xml",
+                output_dir=tmp,
+                cache_path=tmp / ".translation-cache.json",
+                openai_api_key="dummy",
+                openai_base_url="https://api.openai.com/v1",
+                openai_model="gpt-4.1-mini",
+                max_urls=1,
+                request_timeout=1,
+                per_page_sleep=0,
+                translate_sleep=0,
+                openai_max_retries=0,
+                state_path=state,
+            )
+
+            import scripts.translate_site as mod
+            entry = mod.SitemapEntry(url="https://docs.world.org/page", lastmod="2026-01-01")
+
+            with patch("scripts.translate_site.parse_sitemap", return_value=[entry]):
+                with patch("scripts.translate_site.has_source_changed", return_value=True):
+                    with patch("scripts.translate_site.fetch_text", return_value="<html><main><p>Hello</p></main></html>"):
+                        with patch(
+                            "scripts.translate_site.translate_segment",
+                            side_effect=RateLimitError("429", retry_after=0),
+                        ):
+                            summary = run(cfg)
+
+            self.assertTrue(summary.get("skipped"))
+            self.assertEqual(summary.get("skip_reason"), "rate_limited")
+            self.assertGreaterEqual(summary.get("rate_limit_count", 0), 1)
+            self.assertEqual(summary.get("summary_version"), 1)
+            self.assertIn("elapsed_seconds", summary)
 
 
 if __name__ == "__main__":
