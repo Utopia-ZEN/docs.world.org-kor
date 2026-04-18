@@ -24,6 +24,7 @@ class DummySession:
 class TranslateSiteTests(unittest.TestCase):
     def test_should_translate_text(self):
         self.assertTrue(should_translate_text("Install World App now"))
+        self.assertTrue(should_translate_text("Hello"))
         self.assertFalse(should_translate_text("   "))
         self.assertFalse(should_translate_text("/api/v1/users"))
         self.assertFalse(should_translate_text("이미 한글입니다"))

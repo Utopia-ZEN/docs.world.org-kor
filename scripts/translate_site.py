@@ -183,7 +183,7 @@ def should_translate_text(text: str) -> bool:
         return False
     if KOREAN_RE.search(stripped):
         return False
-    if IDENTIFIER_ONLY_RE.fullmatch(stripped):
+    if IDENTIFIER_ONLY_RE.fullmatch(stripped) and any(ch in stripped for ch in "/._:#-"):
         return False
     return True
 def preserve_surrounding_whitespace(original: str, translated: str) -> str:
