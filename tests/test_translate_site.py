@@ -168,6 +168,12 @@ class TranslateSiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             state = tmp / ".state/source-fingerprint.json"
+            progress = tmp / ".state/translated-pages.json"
+            progress.parent.mkdir(parents=True, exist_ok=True)
+            progress.write_text(
+                '{"pages": {"https://docs.world.org/page": "2026-01-01"}, "deferred": []}',
+                encoding="utf-8",
+            )
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text('{"fingerprint":"dummy"}', encoding="utf-8")
 
@@ -185,6 +191,7 @@ class TranslateSiteTests(unittest.TestCase):
                 translate_sleep=0,
                 openai_max_retries=0,
                 state_path=state,
+                progress_state_path=progress,
             )
 
             import scripts.translate_site as mod
@@ -237,6 +244,45 @@ class TranslateSiteTests(unittest.TestCase):
             self.assertEqual(summary.get("summary_version"), 1)
             self.assertIn("elapsed_seconds", summary)
             self.assertIn("deferred_count", summary)
+
+    def test_run_processes_deferred_even_when_source_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state = tmp / ".state/source-fingerprint.json"
+            progress = tmp / ".state/translated-pages.json"
+            progress.parent.mkdir(parents=True, exist_ok=True)
+            progress.write_text(
+                '{"pages": {}, "deferred": ["https://docs.world.org/page"]}',
+                encoding="utf-8",
+            )
+            cfg = Config(
+                base_url="https://docs.world.org",
+                sitemap_url="https://docs.world.org/sitemap.xml",
+                output_dir=tmp,
+                cache_path=tmp / ".translation-cache.json",
+                openai_api_key="dummy",
+                openai_base_url="https://api.openai.com/v1",
+                openai_model="gpt-4.1-mini",
+                max_urls=1,
+                request_timeout=1,
+                per_page_sleep=0,
+                translate_sleep=0,
+                openai_max_retries=0,
+                state_path=state,
+                progress_state_path=progress,
+            )
+
+            import scripts.translate_site as mod
+            entry = mod.SitemapEntry(url="https://docs.world.org/page", lastmod="2026-01-01")
+
+            with patch("scripts.translate_site.parse_sitemap", return_value=[entry]):
+                with patch("scripts.translate_site.has_source_changed", return_value=False):
+                    with patch("scripts.translate_site.fetch_text", return_value="<html><main><p>Hello</p></main></html>"):
+                        with patch("scripts.translate_site.translate_segment", return_value="안녕"):
+                            summary = run(cfg)
+
+            self.assertFalse(summary.get("skipped"))
+            self.assertEqual(summary.get("translated_count"), 1)
 
 
 if __name__ == "__main__":

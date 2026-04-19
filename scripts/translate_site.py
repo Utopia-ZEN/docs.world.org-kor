@@ -682,7 +682,7 @@ def run(cfg: Config) -> Dict[str, object]:
         pending_urls = pending_urls[: cfg.max_pages_per_run]
 
     stats.urls_total = len(pending_urls)
-    if not has_source_changed(entries, cfg.state_path):
+    if not has_source_changed(entries, cfg.state_path) and not pending_urls:
         summary = build_summary(
             cfg=cfg,
             stats=stats,
