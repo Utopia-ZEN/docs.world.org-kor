@@ -9,9 +9,11 @@ from scripts.translate_site import (
     Config,
     RateLimitError,
     TranslationStats,
+    _parse_json_array,
     output_path_for_url,
     preserve_surrounding_whitespace,
     run,
+    sort_by_priority,
     should_translate_text,
     translate_html,
 )
@@ -40,6 +42,26 @@ class TranslateSiteTests(unittest.TestCase):
     def test_output_path_for_url(self):
         out = output_path_for_url("https://docs.world.org/developers", Path("output"))
         self.assertEqual(str(out), "output/developers/index.html")
+
+    def test_sort_by_priority(self):
+        urls = [
+            "https://docs.world.org/api-reference/foo",
+            "https://docs.world.org/agents/bar",
+            "https://docs.world.org/zzz",
+        ]
+        ordered = sort_by_priority(urls, ["/agents/", "/api-reference/"])
+        self.assertEqual(
+            ordered,
+            [
+                "https://docs.world.org/agents/bar",
+                "https://docs.world.org/api-reference/foo",
+                "https://docs.world.org/zzz",
+            ],
+        )
+
+    def test_parse_json_array_with_code_fence(self):
+        parsed = _parse_json_array("```json\n[\"a\", \"b\"]\n```")
+        self.assertEqual(parsed, ["a", "b"])
 
     def test_translate_html_skips_code(self):
         html = """
@@ -119,6 +141,8 @@ class TranslateSiteTests(unittest.TestCase):
             self.assertEqual(summary.get("summary_version"), 1)
             self.assertIn("elapsed_seconds", summary)
             self.assertIn("cache_hit_ratio", summary)
+            self.assertIn("pending_count", summary)
+            self.assertIn("deferred_count", summary)
 
     def test_run_skips_when_no_source_changes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -153,6 +177,7 @@ class TranslateSiteTests(unittest.TestCase):
             self.assertTrue(summary.get("skipped"))
             self.assertEqual(summary.get("skip_reason"), "no_source_changes")
             self.assertEqual(summary.get("summary_version"), 1)
+            self.assertIn("pending_count", summary)
 
     def test_run_marks_rate_limited_when_all_pages_fail_with_429(self):
         with tempfile.TemporaryDirectory() as td:
@@ -191,6 +216,7 @@ class TranslateSiteTests(unittest.TestCase):
             self.assertGreaterEqual(summary.get("rate_limit_count", 0), 1)
             self.assertEqual(summary.get("summary_version"), 1)
             self.assertIn("elapsed_seconds", summary)
+            self.assertIn("deferred_count", summary)
 
 
 if __name__ == "__main__":

@@ -34,7 +34,11 @@ python scripts/translate_site.py \
 - `--openai-max-retries` (기본: `4`)
 - `--request-timeout` (기본: `30`)
 - `--state-path` (기본: `.state/source-fingerprint.json`)
+- `--progress-state-path` (기본: `.state/translated-pages.json`)
 - `--translate-sleep` (기본: `0.03`, 과금/429 완화를 위해 증가 가능)
+- `--max-pages-per-run` / `--max-segments-per-run` / `--max-runtime-seconds` 실행 예산 제어
+- `--max-batch-items` 미번역 세그먼트 배치 번역 크기
+- `--priority-prefixes` 우선 번역 경로 prefix 지정
 
 출력:
 
@@ -49,7 +53,9 @@ python scripts/translate_site.py \
 - `abort_reason`
 - `elapsed_seconds`
 - `cache_hit_ratio`
+- `stats.api_calls_total`
 - 구조화된 `errors` 항목(`url`, `error_type`, `status_code`, `message`)
+- `pending_count`, `translated_count`, `deferred_count`
 
 ## 자동 실행 (GitHub Actions)
 
@@ -78,3 +84,4 @@ python -m unittest discover -s tests -p 'test_*.py'
 - GitHub Actions에서는 실행 로그와 아티팩트(`output`)를 Actions 탭에서 확인할 수 있습니다. 변경이 없으면 배포 단계는 PASS됩니다.
 - 429가 반복되면 런타임에서 자동으로 대기 시간을 늘리고, 연속 429가 임계치에 도달하면 해당 실행은 중단(ABORT)하여 빈번한 실패 로그 폭증을 방지합니다.
 - 429로 인해 실제 번역 성공(`urls_ok`)이 0건이면 `skip_reason=rate_limited`로 처리되어 배포를 건너뛰고 기존 Pages를 유지합니다.
+- 진행 상태는 `.state/translated-pages.json`에 저장되어 다음 실행에서 deferred URL을 우선 재시도합니다.

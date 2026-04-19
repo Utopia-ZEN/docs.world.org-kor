@@ -25,6 +25,7 @@ DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_CACHE_PATH = ".translation-cache.json"
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_STATE_PATH = ".state/source-fingerprint.json"
+DEFAULT_PROGRESS_STATE_PATH = ".state/translated-pages.json"
 SUMMARY_VERSION = 1
 SKIP_TAGS = {"script", "style", "code", "pre", "kbd", "samp", "noscript"}
 SKIP_CONTAINERS = {
@@ -54,6 +55,12 @@ class Config:
     translate_sleep: float
     openai_max_retries: int
     state_path: Path
+    progress_state_path: Path = Path(DEFAULT_PROGRESS_STATE_PATH)
+    max_pages_per_run: int = 30
+    max_segments_per_run: int = 400
+    max_runtime_seconds: int = 900
+    max_batch_items: int = 20
+    priority_prefixes: List[str] = None  # type: ignore[assignment]
 @dataclass
 class TranslationStats:
     urls_total: int = 0
@@ -62,6 +69,7 @@ class TranslationStats:
     segments_total: int = 0
     segments_cached: int = 0
     segments_translated: int = 0
+    api_calls_total: int = 0
 
 
 class RateLimitError(Exception):
@@ -144,6 +152,34 @@ def parse_args() -> argparse.Namespace:
         "--state-path",
         default=os.getenv("STATE_PATH", DEFAULT_STATE_PATH),
     )
+    parser.add_argument(
+        "--progress-state-path",
+        default=os.getenv("PROGRESS_STATE_PATH", DEFAULT_PROGRESS_STATE_PATH),
+    )
+    parser.add_argument(
+        "--max-pages-per-run",
+        type=int,
+        default=int(os.getenv("MAX_PAGES_PER_RUN", "30")),
+    )
+    parser.add_argument(
+        "--max-segments-per-run",
+        type=int,
+        default=int(os.getenv("MAX_SEGMENTS_PER_RUN", "400")),
+    )
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        default=int(os.getenv("MAX_RUNTIME_SECONDS", "900")),
+    )
+    parser.add_argument(
+        "--max-batch-items",
+        type=int,
+        default=int(os.getenv("MAX_BATCH_ITEMS", "20")),
+    )
+    parser.add_argument(
+        "--priority-prefixes",
+        default=os.getenv("PRIORITY_PREFIXES", "/agents/,/mini-apps/,/api-reference/"),
+    )
     return parser.parse_args()
 def build_config(args: argparse.Namespace) -> Config:
     return Config(
@@ -160,7 +196,45 @@ def build_config(args: argparse.Namespace) -> Config:
         translate_sleep=args.translate_sleep,
         openai_max_retries=args.openai_max_retries,
         state_path=Path(args.state_path),
+        progress_state_path=Path(args.progress_state_path),
+        max_pages_per_run=args.max_pages_per_run,
+        max_segments_per_run=args.max_segments_per_run,
+        max_runtime_seconds=args.max_runtime_seconds,
+        max_batch_items=args.max_batch_items,
+        priority_prefixes=[p.strip() for p in str(args.priority_prefixes).split(",") if p.strip()],
     )
+
+
+def load_progress_state(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {"pages": {}, "deferred": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"pages": {}, "deferred": []}
+    pages = raw.get("pages", {})
+    deferred = raw.get("deferred", [])
+    if not isinstance(pages, dict):
+        pages = {}
+    if not isinstance(deferred, list):
+        deferred = []
+    return {"pages": pages, "deferred": deferred}
+
+
+def save_progress_state(path: Path, state: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def sort_by_priority(urls: List[str], prefixes: List[str]) -> List[str]:
+    def rank(u: str) -> tuple[int, str]:
+        path = urlparse(u).path or "/"
+        for idx, pref in enumerate(prefixes):
+            if path.startswith(pref):
+                return (idx, path)
+        return (len(prefixes), path)
+
+    return sorted(urls, key=rank)
 def load_cache(path: Path) -> Dict[str, str]:
     if not path.exists():
         return {}
@@ -273,6 +347,56 @@ def translate_segment(session: requests.Session, cfg: Config, text: str) -> str:
     )
     content = res.json()["choices"][0]["message"]["content"]
     return str(content).strip()
+
+
+def _parse_json_array(content: str) -> List[object]:
+    raw = content.strip()
+    if raw.startswith("```"):
+        # common model response shape: ```json ... ```
+        raw = raw.strip("`")
+        raw = raw.replace("json\n", "", 1).strip()
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise RuntimeError("expected JSON array")
+    return parsed
+
+
+def translate_segments_batch(session: requests.Session, cfg: Config, texts: List[str]) -> List[str]:
+    if not texts:
+        return []
+    if not cfg.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for translation")
+
+    system_prompt = (
+        "Translate each input string into natural Korean for technical docs. "
+        "Preserve code blocks, inline backticks, identifiers, URLs, file paths, shell commands, and version strings exactly. "
+        "Return ONLY a JSON array of translated strings in the same order and same length."
+    )
+    user_payload = json.dumps(texts, ensure_ascii=False)
+    res = request_with_retry(
+        session,
+        "POST",
+        f"{cfg.openai_base_url}/chat/completions",
+        timeout=cfg.request_timeout,
+        max_retries=cfg.openai_max_retries,
+        headers={
+            "Authorization": f"Bearer {cfg.openai_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": cfg.openai_model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload},
+            ],
+        },
+    )
+    content = str(res.json()["choices"][0]["message"]["content"]).strip()
+    parsed = _parse_json_array(content)
+    if len(parsed) != len(texts):
+        raise RuntimeError("batch translation response shape mismatch")
+    return [str(x).strip() for x in parsed]
 def fetch_text(session: requests.Session, url: str, timeout: int) -> str:
     res = request_with_retry(session, "GET", url, timeout=timeout, max_retries=3)
     return res.text
@@ -340,18 +464,8 @@ def translate_html(
 ) -> str:
     soup = BeautifulSoup(html, "lxml")
     main = pick_main_content(soup)
-    def translate_value(original: str) -> str:
-        normalized = normalize_text(original)
-        stats.segments_total += 1
-        key = digest(cfg.openai_model, normalized)
-        if key in cache:
-            stats.segments_cached += 1
-            return preserve_surrounding_whitespace(original, cache[key])
-        translated = translate_segment(session, cfg, normalized)
-        cache[key] = translated
-        stats.segments_translated += 1
-        time.sleep(cfg.translate_sleep)
-        return preserve_surrounding_whitespace(original, translated)
+
+    ops: List[Dict[str, object]] = []
     for text_node in list(main.find_all(string=True)):
         parent = text_node.parent
         if not isinstance(parent, Tag) or should_skip_node(parent):
@@ -359,7 +473,8 @@ def translate_html(
         original = str(text_node)
         if not should_translate_text(original):
             continue
-        text_node.replace_with(NavigableString(translate_value(original)))
+        ops.append({"kind": "text", "node": text_node, "original": original, "normalized": normalize_text(original)})
+
     for el in main.find_all(True):
         if should_skip_node(el):
             continue
@@ -367,7 +482,49 @@ def translate_html(
             if attr in el.attrs:
                 raw_value = str(el.attrs[attr])
                 if should_translate_text(raw_value):
-                    el.attrs[attr] = translate_value(raw_value)
+                    ops.append({"kind": "attr", "el": el, "attr": attr, "original": raw_value, "normalized": normalize_text(raw_value)})
+
+    pending: List[Dict[str, object]] = []
+    for op in ops:
+        normalized = str(op["normalized"])
+        stats.segments_total += 1
+        key = digest(cfg.openai_model, normalized)
+        op["cache_key"] = key
+        if key in cache:
+            stats.segments_cached += 1
+            op["translated"] = cache[key]
+        else:
+            pending.append(op)
+
+    # Batch translate uncached segments for fewer API calls.
+    for i in range(0, len(pending), max(cfg.max_batch_items, 1)):
+        chunk = pending[i : i + max(cfg.max_batch_items, 1)]
+        texts = [str(op["normalized"]) for op in chunk]
+        try:
+            translated = translate_segments_batch(session, cfg, texts)
+            stats.api_calls_total += 1
+        except Exception:
+            # Fallback to single-segment translation for robustness.
+            translated = []
+            for t in texts:
+                translated.append(translate_segment(session, cfg, t))
+                stats.api_calls_total += 1
+
+        for op, out in zip(chunk, translated):
+            op["translated"] = out
+            cache[str(op["cache_key"])] = out
+            stats.segments_translated += 1
+        time.sleep(cfg.translate_sleep)
+
+    for op in ops:
+        translated = preserve_surrounding_whitespace(str(op["original"]), str(op["translated"]))
+        if op["kind"] == "text":
+            node = op["node"]
+            node.replace_with(NavigableString(translated))
+        else:
+            el = op["el"]
+            attr = str(op["attr"])
+            el.attrs[attr] = translated
     if isinstance(soup.html, Tag):
         soup.html.attrs["lang"] = "ko"
     rewrite_internal_links_to_relative(soup, cfg.base_url)
@@ -424,6 +581,13 @@ def run(cfg: Config) -> Dict[str, object]:
     started = time.time()
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     cache = load_cache(cfg.cache_path)
+    progress = load_progress_state(cfg.progress_state_path)
+    pages_state = progress.get("pages", {})
+    deferred_state = progress.get("deferred", [])
+    if not isinstance(pages_state, dict):
+        pages_state = {}
+    if not isinstance(deferred_state, list):
+        deferred_state = []
     stats = TranslationStats()
     session = requests.Session()
     processed: List[str] = []
@@ -445,8 +609,17 @@ def run(cfg: Config) -> Dict[str, object]:
         print(f"[SITEMAP_ERR] {cfg.sitemap_url}: {exc}")
         entries = [SitemapEntry(url=cfg.base_url, lastmod="")]
     entries = entries[: cfg.max_urls]
-    urls = [e.url for e in entries]
-    stats.urls_total = len(urls)
+    entry_map = {e.url: e for e in entries}
+    changed_urls = [
+        e.url for e in entries if str(pages_state.get(e.url, "")) != str(e.lastmod or "")
+    ]
+    deferred_urls = [u for u in deferred_state if u in entry_map]
+    pending_urls = list(dict.fromkeys(deferred_urls + changed_urls))
+    pending_urls = sort_by_priority(pending_urls, cfg.priority_prefixes or [])
+    if cfg.max_pages_per_run > 0:
+        pending_urls = pending_urls[: cfg.max_pages_per_run]
+
+    stats.urls_total = len(pending_urls)
     if not has_source_changed(entries, cfg.state_path):
         summary = build_summary(
             cfg=cfg,
@@ -459,6 +632,9 @@ def run(cfg: Config) -> Dict[str, object]:
             rate_limit_count=rate_limit_errors,
             abort_reason=abort_reason,
         )
+        summary["pending_count"] = len(pending_urls)
+        summary["translated_count"] = 0
+        summary["deferred_count"] = len(deferred_state)
         (cfg.output_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -467,7 +643,16 @@ def run(cfg: Config) -> Dict[str, object]:
         print("[PASS] No source changes detected. Skipping translation.")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return summary
-    for url in urls:
+    new_deferred: List[str] = []
+    for idx, url in enumerate(pending_urls):
+        if (time.time() - started) >= cfg.max_runtime_seconds:
+            abort_reason = "runtime_budget_exceeded"
+            new_deferred.extend(pending_urls[idx:])
+            break
+        if stats.segments_total >= cfg.max_segments_per_run:
+            abort_reason = "segment_budget_exceeded"
+            new_deferred.extend(pending_urls[idx:])
+            break
         try:
             page = fetch_text(session, url, timeout=cfg.request_timeout)
             translated_html = translate_html(
@@ -482,6 +667,9 @@ def run(cfg: Config) -> Dict[str, object]:
             out.write_text(translated_html, encoding="utf-8")
             processed.append(url)
             stats.urls_ok += 1
+            entry = entry_map.get(url)
+            if entry:
+                pages_state[url] = entry.lastmod or ""
             print(f"[OK] {url} -> {out}")
             time.sleep(cfg.per_page_sleep)
         except RateLimitError as exc:
@@ -510,6 +698,7 @@ def run(cfg: Config) -> Dict[str, object]:
                     }
                 )
                 print("[ABORT] Too many consecutive 429 errors. Stopping this run.")
+                new_deferred.extend(pending_urls[idx:])
                 break
         except Exception as exc:  # noqa: BLE001
             stats.urls_failed += 1
@@ -522,6 +711,18 @@ def run(cfg: Config) -> Dict[str, object]:
                 }
             )
             print(f"[ERR] {url}: {exc}")
+            new_deferred.append(url)
+
+    valid_urls = set(entry_map.keys())
+    deferred_merged = [u for u in dict.fromkeys(new_deferred) if u in valid_urls]
+    save_progress_state(
+        cfg.progress_state_path,
+        {
+            "pages": pages_state,
+            "deferred": deferred_merged,
+            "updated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
     build_index(cfg.output_dir, processed)
     save_cache(cfg.cache_path, cache)
     # If the run effectively failed due to rate limiting, mark as skipped so
@@ -538,6 +739,9 @@ def run(cfg: Config) -> Dict[str, object]:
             rate_limit_count=rate_limit_errors,
             abort_reason=abort_reason or "rate_limited_zero_success",
         )
+        summary["pending_count"] = len(pending_urls)
+        summary["translated_count"] = stats.urls_ok
+        summary["deferred_count"] = len(deferred_merged)
         (cfg.output_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -557,6 +761,9 @@ def run(cfg: Config) -> Dict[str, object]:
         rate_limit_count=rate_limit_errors,
         abort_reason=abort_reason,
     )
+    summary["pending_count"] = len(pending_urls)
+    summary["translated_count"] = stats.urls_ok
+    summary["deferred_count"] = len(deferred_merged)
     (cfg.output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",

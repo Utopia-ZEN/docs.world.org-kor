@@ -54,9 +54,15 @@ jobs:
           MAX_URLS: '30'
           OUTPUT_DIR: output
           STATE_PATH: .state/source-fingerprint.json
+          PROGRESS_STATE_PATH: .state/translated-pages.json
           OPENAI_MAX_RETRIES: '8'
           SLEEP_BETWEEN_REQUESTS: '1.0'
           SLEEP_BETWEEN_TRANSLATIONS: '0.6'
+          MAX_PAGES_PER_RUN: '30'
+          MAX_SEGMENTS_PER_RUN: '400'
+          MAX_RUNTIME_SECONDS: '900'
+          MAX_BATCH_ITEMS: '20'
+          PRIORITY_PREFIXES: '/agents/,/mini-apps/,/api-reference/'
         run: python scripts/translate_site.py
 
       - name: Detect source change result
