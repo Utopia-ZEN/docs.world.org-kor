@@ -577,6 +577,68 @@ def build_index(output_dir: Path, processed_urls: List[str]) -> None:
 </html>
 """
     (output_dir / "index.html").write_text(html, encoding="utf-8")
+
+
+def build_status_page(output_dir: Path, summary: Dict[str, object]) -> None:
+    stats = summary.get("stats", {}) if isinstance(summary.get("stats"), dict) else {}
+    errors = summary.get("errors", [])
+    error_items = ""
+    if isinstance(errors, list):
+        for err in errors[:20]:
+            if isinstance(err, dict):
+                error_items += (
+                    f"<li><code>{err.get('error_type')}</code> "
+                    f"{err.get('url','')} — {err.get('message','')}</li>"
+                )
+    if not error_items:
+        error_items = "<li>없음</li>"
+
+    html = f"""<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <title>번역 파이프라인 상태</title>
+  </head>
+  <body>
+    <h1>번역 파이프라인 상태</h1>
+    <p>생성 시각(UTC): {summary.get('generated_at_utc','')}</p>
+    <ul>
+      <li>summary_version: {summary.get('summary_version','')}</li>
+      <li>skipped: {summary.get('skipped','')}</li>
+      <li>skip_reason: {summary.get('skip_reason','')}</li>
+      <li>pending_count: {summary.get('pending_count','')}</li>
+      <li>translated_count: {summary.get('translated_count','')}</li>
+      <li>deferred_count: {summary.get('deferred_count','')}</li>
+      <li>rate_limit_count: {summary.get('rate_limit_count','')}</li>
+      <li>api_calls_total: {stats.get('api_calls_total','')}</li>
+      <li>urls_ok: {stats.get('urls_ok','')}</li>
+      <li>urls_failed: {stats.get('urls_failed','')}</li>
+    </ul>
+    <h2>최근 오류 (최대 20)</h2>
+    <ol>{error_items}</ol>
+    <p><a href="./summary.json">raw summary.json 보기</a></p>
+    <p><a href="./index.html">메인 미러 페이지</a></p>
+  </body>
+</html>
+"""
+    (output_dir / "status.html").write_text(html, encoding="utf-8")
+
+    md = "\n".join(
+        [
+            "# 번역 파이프라인 상태",
+            f"- generated_at_utc: {summary.get('generated_at_utc','')}",
+            f"- skipped: {summary.get('skipped','')}",
+            f"- skip_reason: {summary.get('skip_reason','')}",
+            f"- pending_count: {summary.get('pending_count','')}",
+            f"- translated_count: {summary.get('translated_count','')}",
+            f"- deferred_count: {summary.get('deferred_count','')}",
+            f"- rate_limit_count: {summary.get('rate_limit_count','')}",
+            f"- api_calls_total: {stats.get('api_calls_total','')}",
+            "",
+            "자세한 값은 `summary.json` 및 `status.html` 참고",
+        ]
+    )
+    (output_dir / "README.md").write_text(md, encoding="utf-8")
 def run(cfg: Config) -> Dict[str, object]:
     started = time.time()
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -640,6 +702,7 @@ def run(cfg: Config) -> Dict[str, object]:
             encoding="utf-8",
         )
         build_index(cfg.output_dir, processed)
+        build_status_page(cfg.output_dir, summary)
         print("[PASS] No source changes detected. Skipping translation.")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return summary
@@ -746,6 +809,7 @@ def run(cfg: Config) -> Dict[str, object]:
             json.dumps(summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        build_status_page(cfg.output_dir, summary)
         print("[PASS] Skipping deploy because translation run was rate-limited.")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return summary
@@ -768,6 +832,7 @@ def run(cfg: Config) -> Dict[str, object]:
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    build_status_page(cfg.output_dir, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 def main() -> None:

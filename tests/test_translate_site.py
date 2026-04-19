@@ -10,6 +10,7 @@ from scripts.translate_site import (
     RateLimitError,
     TranslationStats,
     _parse_json_array,
+    build_status_page,
     output_path_for_url,
     preserve_surrounding_whitespace,
     run,
@@ -62,6 +63,25 @@ class TranslateSiteTests(unittest.TestCase):
     def test_parse_json_array_with_code_fence(self):
         parsed = _parse_json_array("```json\n[\"a\", \"b\"]\n```")
         self.assertEqual(parsed, ["a", "b"])
+
+    def test_build_status_page_creates_outputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            summary = {
+                "summary_version": 1,
+                "generated_at_utc": "2026-04-19T00:00:00Z",
+                "skipped": True,
+                "skip_reason": "no_source_changes",
+                "pending_count": 1,
+                "translated_count": 0,
+                "deferred_count": 1,
+                "rate_limit_count": 0,
+                "stats": {"api_calls_total": 0, "urls_ok": 0, "urls_failed": 0},
+                "errors": [],
+            }
+            build_status_page(out, summary)
+            self.assertTrue((out / "status.html").exists())
+            self.assertTrue((out / "README.md").exists())
 
     def test_translate_html_skips_code(self):
         html = """

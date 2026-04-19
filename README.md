@@ -43,8 +43,10 @@ python scripts/translate_site.py \
 출력:
 
 - `output/index.html`
+- `output/status.html` (현재 적용/진행 상태 대시보드)
 - `output/**/index.html`
 - `output/summary.json`
+- `output/README.md` (최신 상태 요약)
 - `.translation-cache.json`
 
 `summary.json`에는 실행 진단용 메타데이터도 포함됩니다:
@@ -85,3 +87,4 @@ python -m unittest discover -s tests -p 'test_*.py'
 - 429가 반복되면 런타임에서 자동으로 대기 시간을 늘리고, 연속 429가 임계치에 도달하면 해당 실행은 중단(ABORT)하여 빈번한 실패 로그 폭증을 방지합니다.
 - 429로 인해 실제 번역 성공(`urls_ok`)이 0건이면 `skip_reason=rate_limited`로 처리되어 배포를 건너뛰고 기존 Pages를 유지합니다.
 - 진행 상태는 `.state/translated-pages.json`에 저장되어 다음 실행에서 deferred URL을 우선 재시도합니다.
+- 배포된 사이트에서 진행 현황은 `/status.html`로 확인할 수 있습니다.
